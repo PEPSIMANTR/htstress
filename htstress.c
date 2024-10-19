@@ -29,23 +29,40 @@ OF SUCH DAMAGE.
 */
 
 #include <string.h>
-#include <netdb.h>
 #include <stdio.h>
-#include <pthread.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <netinet/ip.h>
 #include <errno.h>
 #include <malloc.h>
 #include <stdlib.h>
 #include <fcntl.h>
-#include <sys/time.h>
 #include <malloc.h>
-#include <getopt.h>
 #include <signal.h>
-#include <sys/epoll.h>
 #include <inttypes.h>
+
+
+#ifdef _WIN32
+	#include <WS2tcpip.h>
+	#pragma comment(lib,"WS2_32.lib")
+	#define WIN32_LEAN_AND_MEAN
+	#pragma warning(disable:4996)
+	#include "wepoll.h"
+	#include "getopt.h"
+	#define ThreadEntry WINAPI
+#else
+	#include <netdb.h>
+	#include <pthread.h>
+	#include <sys/socket.h>
+	#include <netinet/in.h>
+	#include <netinet/tcp.h>
+	#include <netinet/ip.h>
+	#include <sys/time.h>
+	#include <getopt.h>
+	#include <sys/epoll.h>
+	#define closesocket close
+	#define SOCKET int
+	#define ThreadEntry
+#endif
+
+//#include <stdatomic.h>
 
 #define HTTP_REQUEST_PREFIX "http://"
 
@@ -61,7 +78,7 @@ OF SUCH DAMAGE.
 #define MAX_EVENTS 256
 
 struct econn {
-	int fd;
+	SOCKET fd;
 	size_t offs;
 	int flags;
 };
@@ -71,7 +88,7 @@ size_t outbufsize;
 
 struct sockaddr_in ssin;
 
-int concurrency = 1;
+int concurrency = 2;
 int num_threads = 1;
 
 volatile uint64_t num_requests = 0;
@@ -133,12 +150,24 @@ static void init_conn(int efd, struct econn* ec) {
 		exit(1);
 	}
 
+#ifdef _WIN32
+	//u_long iMode = 1;
+	//int iResult = ioctlsocket(ec->fd, FIONBIO, &iMode);
+	//if (iResult != NO_ERROR)
+	//	printf("ioctlsocket failed with error: %ld\n", iResult);
+#else
 	fcntl(ec->fd, F_SETFL, O_NONBLOCK);
+#endif
 
 	ret = connect(ec->fd, (struct sockaddr*)&ssin, sizeof(ssin));
 
 	if (ret && errno != EINPROGRESS) {
+#ifdef _WIN32
+		ret = WSAGetLastError();
+		printf("connect() failed: %d\n", ret);
+#else
 		perror("connect() failed");
+#endif
 		exit(1);
 	}
 
@@ -151,12 +180,12 @@ static void init_conn(int efd, struct econn* ec) {
 	}
 }
 
-static void* worker(void* arg) 
+static void* ThreadEntry worker(void* arg) 
 {
 	int efd, fd, ret, nevts, n, m;
 	struct epoll_event evts[MAX_EVENTS];
 	char inbuf[INBUFSIZE], c;
-	struct econn ecs[concurrency], *ec;
+	struct econn *ecs=malloc(concurrency*sizeof(struct econn)), * ec;
 
 	efd = epoll_create(concurrency);
 
@@ -255,18 +284,26 @@ static void* worker(void* arg)
 
 				if (!ret) {
 
-					close(ec->fd);
+					if (epoll_ctl(efd, EPOLL_CTL_DEL, ec->fd, evts + n)) {
+						perror("epoll_ctl");
+						exit(1);
+					} closesocket(ec->fd);
 
-					m = __sync_fetch_and_add(&num_requests, 1);
+					//m = __sync_fetch_and_add(&num_requests, 1);
+					m = num_requests;
+					num_requests++;
 
 					if (max_requests && m + 1 > max_requests)
-						__sync_fetch_and_sub(&num_requests, 1);
+						//__sync_fetch_and_sub(&num_requests, 1);
+						num_requests--;
 
 					else if (ec->flags & BAD_REQUEST)
-						__sync_fetch_and_add(&bad_requests, 1);
+						//__sync_fetch_and_add(&bad_requests, 1);
+						bad_requests++;
 
 					else
-						__sync_fetch_and_add(&good_requests, 1);
+						//__sync_fetch_and_add(&good_requests, 1);
+						good_requests++;
 
 					if (max_requests && m + 1 >= max_requests) {
 						end_time();
@@ -287,22 +324,25 @@ static void print_usage()
 {
 	printf("Usage: htstress [options] [http://]hostname[:port]/path\n"
 			"Options:\n"
-			"   -n, --number       total number of requests (0 for inifinite, Ctrl-C to abort)\n"
-			"   -c, --concurrency  number of concurrent connections\n"
-			"   -t, --threads      number of threads (set this to the number of CPU cores)\n"
-			"   -d, --debug        debug HTTP response\n"
-			"   --help             display this message\n"
+			"   -n, total number of requests (0 for inifinite, Ctrl-C to abort)\n"
+			"   -c, number of concurrent connections\n"
+			"   -t, number of threads (set this to the number of CPU cores)\n"
+			"   -d, debug HTTP response\n"
+			"   -h, display this message\n"
 		  );
 	exit(0);
 }
 
-int main(int argc, char* argv[]) 
-{
-	char *rq, *s;
+int main(int argc, char* argv[])  {
+	char *rq, *s=NULL;
 	double delta, rps;
 	int next_option;
 	int n;
+#ifdef _WIN32
+	HANDLE useless_thread;
+#else
 	pthread_t useless_thread;
+#endif
 	int port = 80;
 	char *host = NULL;
 	struct hostent *h;
@@ -310,46 +350,71 @@ int main(int argc, char* argv[])
 	if (argc == 1)
 		print_usage();
 
-	do {
-		next_option = getopt_long(argc, argv, short_options, long_options, NULL);
+	//do {
+	//	next_option = getopt_long(argc-1, argv+1, short_options, long_options, NULL);
+	//
+	//	switch (next_option) {
+	//
+	//		case 'n':
+	//			max_requests = strtoull(optarg, 0, 10);
+	//			break;
+	//
+	//		case 'c':
+	//			concurrency = atoi(optarg);
+	//			break;
+	//
+	//		case 't':
+	//			num_threads = atoi(optarg);
+	//			break;
+	//
+	//		case 'd':
+	//			debug = 0x03;
+	//			break;
+	//
+	//		case '%':
+	//			print_usage();
+	//
+	//		case -1:
+	//			break;
+	//
+	//		default:
+	//			printf("Unexpected argument: '%c'\n", next_option);
+	//			return 1;
+	//	}
+	//} while (next_option != -1);
 
-		switch (next_option) {
+	for (int i = 1; i < argc; i++) {
+		if (argv[i][0] != '-') { // Treat as end of options (so, the URL)
+			s = argv[i]; break;
+		}
 
+		switch (argv[i][1]) {
 			case 'n':
-				max_requests = strtoull(optarg, 0, 10);
-				break;
-
+				max_requests = strtoull(argv[i+1], 0, 10);
+				i++; break;
+			
 			case 'c':
-				concurrency = atoi(optarg);
-				break;
-
+				concurrency = atoi(argv[i + 1]);
+				i++; break;
+			
 			case 't':
-				num_threads = atoi(optarg);
-				break;
-
+				num_threads = atoi(argv[i + 1]);
+				i++; break;
+			
 			case 'd':
 				debug = 0x03;
 				break;
 
-			case '%':
-				print_usage();
-
-			case -1:
-				break;
-
-			default:
-				printf("Unexpected argument: '%c'\n", next_option);
-				return 1;
+			case 'h':
+			case '?':
+				print_usage(); return 0; break;
 		}
-	} while (next_option != -1);
+	}
 
-	if (optind >= argc) {
+	if (!s) {
 		printf("Missing URL\n");
 		return 1;
 	}
-
-	/* parse URL */
-	s = argv[optind];
 
 	if (!strncmp(s, HTTP_REQUEST_PREFIX, sizeof(HTTP_REQUEST_PREFIX) - 1))
 		s += (sizeof(HTTP_REQUEST_PREFIX) - 1);
@@ -373,13 +438,26 @@ int main(int argc, char* argv[])
 			rq = "/";
 	}
 
-	h = gethostbyname(host);
-	if (!h || !h->h_length) {
-		printf("gethostbyname failed\n");
+#ifdef _WIN32
+	WSADATA wd;
+	if (WSAStartup(MAKEWORD(2, 2), &wd) != NO_ERROR) {
+		wprintf(L"Error at WSAStartup()\n");
 		return 1;
 	}
+#endif
 
-	ssin.sin_addr.s_addr = *(u_int32_t*)h->h_addr;
+	int ret = inet_pton(AF_INET, host, &ssin.sin_addr);
+	if (ret == -1) {
+		h = gethostbyname(host);
+		if (!h || !h->h_length) {
+			printf("gethostbyname failed\n");
+			return 1;
+		}
+
+		ssin.sin_addr.s_addr = *(unsigned int*)h->h_addr;
+	}
+
+	
 	ssin.sin_family = PF_INET;
 	ssin.sin_port = htons(port);
 
@@ -399,8 +477,12 @@ int main(int argc, char* argv[])
 	start_time();
 
 	/* run test */
-	for(n = 0; n < num_threads - 1; ++n)
+	for (n = 0; n < num_threads - 1; ++n)
+#ifdef _WIN32
+		useless_thread = CreateThread(NULL, NULL, worker, 0, 0, 0);
+#else
 		pthread_create(&useless_thread, 0, &worker, 0);
+#endif
 
 	worker(0);
 
